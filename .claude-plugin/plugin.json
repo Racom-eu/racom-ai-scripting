@@ -1,0 +1,7 @@
+{
+  "name": "racom",
+  "version": "0.1.0",
+  "description": "RACOM engineering skills for Claude Code: RipEx2 / RA2 device API access (skills/api) and future RACOM tooling.",
+  "author": { "name": "RACOM s.r.o." },
+  "keywords": ["racom", "ripex2", "ra2", "rpc", "radio"]
+}

@@ -52,6 +52,16 @@ EOF
   echo "Created $CLAUDE_HOME/CLAUDE.md"
 fi
 
+# Expose this repository as the Claude Code plugin "racom" (skills/<name>/SKILL.md -> /racom:<name>).
+# A symlink in ~/.claude/skills/ makes Claude Code load it IN PLACE as "racom@skills-dir" - no copy,
+# no login needed, survives rebuilds because ~/.claude is the persistent bind mount.
+mkdir -p "$CLAUDE_HOME/skills"
+if [ "$(readlink "$CLAUDE_HOME/skills/racom" 2>/dev/null)" != "/workspaces/workspace" ]; then
+  ln -sfn /workspaces/workspace "$CLAUDE_HOME/skills/racom" \
+    && echo "[RACOM] Linked plugin racom -> $CLAUDE_HOME/skills/racom (skills: /racom:api)." \
+    || echo "[RACOM] Could not link the racom plugin (run: ln -sfn /workspaces/workspace ~/.claude/skills/racom)."
+fi
+
 echo "[RACOM] ${RACOM_ENV_NAME} provisioned."
 echo "[RACOM] Claude Code: $(claude --version 2>/dev/null || echo 'not found')"
 echo "[RACOM] Node:        $(node --version)"
