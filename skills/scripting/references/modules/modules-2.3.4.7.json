@@ -1,0 +1,11 @@
+{
+  "firmware": "2.3.4.7",
+  "python": null,
+  "fetched": "2026-09-15",
+  "partial": true,
+  "note": "Seeded from docs/scripting/writing-scripts.md: 125 stdlib modules were reported but not enumerated. Run `scripting modules --fetch` on a device to replace this with the exact list; `scripting check` treats a partial list as absent and falls back to heuristics.",
+  "stdlib": ["json", "ssl", "socket", "sqlite3", "subprocess", "threading", "asyncio", "logging", "xml", "urllib",
+             "argparse", "sys", "os", "time", "signal", "resource", "re", "base64", "datetime"],
+  "third_party": ["libyang", "lxml", "ncclient", "ssh", "sysrepo", "peewee", "cffi", "api2yang", "sdk_launcher",
+                  "rr_ra2_mgmt", "rr_netconf_mgmt"]
+}

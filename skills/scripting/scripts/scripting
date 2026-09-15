@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Wrapper: prefer the repo .venv (has rr_netconf_mgmt for deploy/undeploy/modules --fetch),
+# fall back to system python3 (enough for new/check/list/run/logs via the stdlib-only RA2 library).
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/../../.." && pwd)"
+PY="${SCRIPTING_PYTHON:-}"
+if [ -z "$PY" ]; then
+  if [ -x "$REPO/.venv/bin/python" ]; then PY="$REPO/.venv/bin/python"; else PY="$(command -v python3)"; fi
+fi
+exec "$PY" "$HERE/scripting_cli.py" "$@"
