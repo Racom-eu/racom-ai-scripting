@@ -1,0 +1,988 @@
+#!/usr/bin/env python3
+"""
+ra2 — command-line access to the RipEx2 / RA2 device HTTPS RPC API.
+
+Thin wrapper around the bundled `rr_ra2_mgmt` library (skills/api/ra2_mgmt, stdlib-only,
+so no virtualenv is needed). Every command prints JSON on stdout and diagnostics on stderr.
+
+    ra2 env                                    resolved connection settings
+    ra2 ping                                   reachability + public device info (no login)
+    ra2 methods [PATTERN]                      library methods with one-line summaries
+    ra2 doc NAME [--full|--search|--list]      API docs lookup (cached mkdocs search index)
+    ra2 call METHOD [PARAMS]                   call a Device method (typed, parsed result)
+    ra2 helper NAME [PARAMS]                   call a Helper flow (init+reconnect, stream, decode)
+    ra2 rpc METHOD [PARAMS] [--public]         raw Racom-RPC call, params sent verbatim
+    ra2 config get|keys|meta|set ...           configuration shortcuts (settings_get / settings_save)
+    ra2 status TYPE...                         decoded status_info records
+
+PARAMS is either one JSON object ('{"limit": 5}') or key=value pairs (limit=5 filter='{"tstamp_from":0}');
+values are parsed as JSON when possible and kept as strings otherwise.
+
+Connection: --host/--port/--user/--password/--token/--intermediate/--timeout/--retries flags, else
+RA2_HOST / RA2_API_PORT / RA2_USER / RA2_PASSWORD / RA2_TOKEN / RA2_INTERMEDIATE / RA2_TIMEOUT /
+RA2_RETRIES environment variables, else a `.env.ra2` file found by walking up from the current
+directory. The HTTPS port applies to the device that is spoken to over HTTPS: the intermediate when
+one is set, the host otherwise.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import dataclasses
+import inspect
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from collections.abc import Iterator
+from html.parser import HTMLParser
+from pathlib import Path
+from typing import Any
+
+SKILL_DIR = Path(__file__).resolve().parent.parent
+LIB_SRC = SKILL_DIR / "ra2_mgmt" / "src"
+sys.path.insert(0, str(LIB_SRC))
+
+try:
+    from rr_ra2_mgmt import transport
+    from rr_ra2_mgmt.device import Device
+    from rr_ra2_mgmt.exceptions import (
+        Ra2CommunicationError,
+        Ra2LoginError,
+        Ra2MgmtError,
+        Ra2RpcError,
+        Ra2SessionExpiredError,
+    )
+    from rr_ra2_mgmt.helper import Helper
+    from rr_ra2_mgmt.models import Envelope
+except ImportError as exc:  # pragma: no cover - environment problem
+    sys.stderr.write(
+        f"ra2: cannot import rr_ra2_mgmt from {LIB_SRC} ({exc}).\n"
+        "     The submodule is probably not initialised. Run:\n"
+        "       git submodule update --init --recursive\n"
+    )
+    sys.exit(1)
+
+DOCS_URL = os.environ.get("RA2_DOCS_URL", "https://ripex2-apidocs.racom.eu").rstrip("/")
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "ra2-apidocs"
+INDEX_TTL = 7 * 24 * 3600
+DEFAULT_TIMEOUT = 15
+DEFAULT_RETRIES = 1
+DEFAULT_API_PORT = 443
+ENV_FILE = ".env.ra2"
+
+# RPCs documented on the API site but not (yet) wrapped by the library — use `ra2 rpc`.
+DOCS_ONLY_METHODS = ("radio_freq_tuning_get", "radio_freq_tuning_set", "keyring_secret_update_init")
+
+# Operations that change device state, reboot it, or destroy data. `ra2 methods` flags them and
+# SKILL.md requires explicit user confirmation before running any of them.
+DESTRUCTIVE_PREFIXES = (
+    "settings_save",
+    "settings_package_save",
+    "monitoring_config_save",
+    "monitoring_log_",
+    "firmware_upload",
+    "firmware_activate",
+    "firmware_module_activate",
+    "file_distribution_",
+    "reboot",
+    "reset_factory",
+    "reset_total_purge",
+    "tamper_reset",
+    "keyring_",
+    "user_",
+    "users_backup_restore",
+    "change_password",
+    "script_start",
+    "script_stop",
+    "keying_",
+    "sw_key_upload",
+    "antenna_detector_",
+    "hstdby_toggle",
+    "time_set",
+    "statistics_differential_reset",
+    "event_test_trigger",
+    "radio_freq_tuning_set",
+)
+DESTRUCTIVE_SAFE = ("keyring_status_get", "keyring_secret_status_get", "user_attributes_get", "monitoring_log_status_get",
+                    "monitoring_log_data_get", "file_distribution_status_send_get", "file_distribution_status_receive_get",
+                    "keyring_backup_get", "keyring_secret_download", "keyring_key_csr_download")
+
+EXIT_USAGE, EXIT_RPC, EXIT_COMM, EXIT_LOGIN = 1, 2, 3, 4
+
+
+# --------------------------------------------------------------------------- utilities
+
+
+def die(msg: str, code: int = EXIT_USAGE) -> None:
+    sys.stderr.write(f"ra2: {msg}\n")
+    sys.exit(code)
+
+
+def info(msg: str) -> None:
+    sys.stderr.write(f"{msg}\n")
+
+
+def to_jsonable(obj: Any) -> Any:
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        return {k: to_jsonable(v) for k, v in dataclasses.asdict(obj).items()}
+    if isinstance(obj, dict):
+        return {k: to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [to_jsonable(v) for v in obj]
+    return obj
+
+
+def dump(obj: Any, compact: bool = False) -> None:
+    text = json.dumps(to_jsonable(obj), ensure_ascii=False, separators=(",", ":") if compact else None,
+                      indent=None if compact else 2)
+    sys.stdout.write(text + "\n")
+    sys.stdout.flush()
+
+
+def parse_value(raw: str) -> Any:
+    """JSON if it parses, `@file` reads a file (base64 when binary), otherwise the literal string."""
+    if raw.startswith("@") and len(raw) > 1:
+        p = Path(raw[1:])
+        if not p.is_file():
+            die(f"file not found: {p}")
+        data = p.read_bytes()
+        try:
+            return json.loads(data)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return base64.b64encode(data).decode()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+
+
+def parse_params(items: list[str]) -> dict[str, Any]:
+    """One JSON object, or key=value pairs. Empty -> {}."""
+    if not items:
+        return {}
+    if len(items) == 1 and items[0].lstrip().startswith("{"):
+        try:
+            obj = json.loads(items[0])
+        except json.JSONDecodeError as exc:
+            die(f"invalid JSON params: {exc}")
+        if not isinstance(obj, dict):
+            die("params JSON must be an object")
+        return obj
+    out: dict[str, Any] = {}
+    for item in items:
+        if "=" not in item:
+            die(f"expected key=value or a single JSON object, got {item!r}")
+        key, _, raw = item.partition("=")
+        out[key.strip()] = parse_value(raw)
+    return out
+
+
+def first_line(doc: str | None) -> str:
+    if not doc:
+        return ""
+    for line in inspect.cleandoc(doc).splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def is_destructive(name: str) -> bool:
+    return name not in DESTRUCTIVE_SAFE and name.startswith(DESTRUCTIVE_PREFIXES)
+
+
+def is_public(fn: Any) -> bool:
+    """A Device method that calls the RPC without authentication (`public=True` in its body)."""
+    try:
+        return "public=True" in inspect.getsource(fn)
+    except (OSError, TypeError):
+        return False
+
+
+# --------------------------------------------------------------------------- connection settings
+
+
+def find_env_file(start: Path) -> Path | None:
+    for d in [start, *start.parents]:
+        cand = d / ENV_FILE
+        if cand.is_file():
+            return cand
+    # also try the repository that holds this skill
+    for d in [SKILL_DIR, *SKILL_DIR.parents]:
+        cand = d / ENV_FILE
+        if cand.is_file():
+            return cand
+    return None
+
+
+def load_env_file(path: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):]
+        k, _, v = line.partition("=")
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
+        out[k.strip()] = v
+    return out
+
+
+def with_port(host: str, port: int) -> str:
+    """`host:port` for the HTTPS endpoint; the default port stays implicit, IPv6 literals get brackets."""
+    if port == DEFAULT_API_PORT:
+        return host
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
+
+
+@dataclasses.dataclass
+class Conn:
+    host: str | None
+    port: int
+    user: str
+    password: str
+    token: str
+    intermediate: str | None
+    timeout: int
+    retries: int
+    source: str
+
+    @property
+    def endpoint(self) -> str:
+        """Device the HTTPS requests go to (intermediate or host), with the API port applied."""
+        assert self.host
+        return with_port(self.intermediate or self.host, self.port)
+
+    def device(self, *, need_auth: bool = True) -> Device:
+        if not self.host:
+            die("no device host: pass --host, set RA2_HOST, or create a .env.ra2 file (see .env.ra2.example)")
+        if need_auth and not (self.token or (self.user and self.password)):
+            die("no credentials: set RA2_USER/RA2_PASSWORD (or RA2_TOKEN) — public methods work with `ra2 rpc --public`",
+                EXIT_LOGIN)
+        # The library takes the port as part of the host string (https://<host>/cgi-bin/...). The port belongs
+        # to the device we connect to: the intermediate in remote access, where `host` is only the RPC target.
+        if self.intermediate:
+            return Device(self.host, self.user, self.password, token=self.token, timeout=self.timeout,
+                          retries=self.retries, intermediate=self.endpoint)
+        return Device(self.endpoint, self.user, self.password, token=self.token, timeout=self.timeout,
+                      retries=self.retries)
+
+    def masked(self) -> dict[str, Any]:
+        return {
+            "host": self.host,
+            "port": self.port,
+            "user": self.user or None,
+            "password": ("*" * 8) if self.password else None,
+            "token": (self.token[:4] + "…") if self.token else None,
+            "intermediate": self.intermediate,
+            "timeout": self.timeout,
+            "retries": self.retries,
+            "source": self.source,
+            "docs_url": DOCS_URL,
+            "library": str(LIB_SRC),
+        }
+
+
+def resolve_conn(args: argparse.Namespace) -> Conn:
+    env: dict[str, str] = {}
+    source = "flags/environment"
+    env_file = find_env_file(Path.cwd())
+    if env_file:
+        env.update(load_env_file(env_file))
+        source = f"{env_file} (+ environment overrides)"
+    env.update({k: v for k, v in os.environ.items() if k.startswith("RA2_")})
+
+    def pick(flag: Any, key: str, default: Any = None) -> Any:
+        if flag is not None:
+            return flag
+        return env.get(key, default)
+
+    timeout = pick(args.timeout, "RA2_TIMEOUT", DEFAULT_TIMEOUT)
+    retries = pick(args.retries, "RA2_RETRIES", DEFAULT_RETRIES)
+    port = pick(args.port, "RA2_API_PORT", DEFAULT_API_PORT) or DEFAULT_API_PORT
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        die(f"invalid API port {port!r}: --port / RA2_API_PORT must be an integer (default {DEFAULT_API_PORT})")
+    if not 1 <= port <= 65535:
+        die(f"invalid API port {port}: must be 1-65535")
+    return Conn(
+        host=pick(args.host, "RA2_HOST") or None,
+        port=port,
+        user=pick(args.user, "RA2_USER", "") or "",
+        password=pick(args.password, "RA2_PASSWORD", "") or "",
+        token=pick(args.token, "RA2_TOKEN", "") or "",
+        intermediate=pick(args.intermediate, "RA2_INTERMEDIATE") or None,
+        timeout=int(timeout),
+        retries=int(retries),
+        source=source,
+    )
+
+
+# --------------------------------------------------------------------------- library introspection
+
+
+def public_methods(cls: type) -> list[tuple[str, Any]]:
+    return [(n, f) for n, f in inspect.getmembers(cls, inspect.isfunction) if not n.startswith("_")]
+
+
+def sections_of(cls: type) -> dict[str, str]:
+    """Map method name -> `# --- Section ---` header preceding it in the class source."""
+    out: dict[str, str] = {}
+    section = "Session"
+    for line in inspect.getsource(cls).splitlines():
+        s = line.strip()
+        m = re.match(r"#\s*---\s*(.+?)\s*-*\s*$", s)
+        if m:
+            section = m.group(1).strip(" -")
+            continue
+        m = re.match(r"def\s+([a-z][a-z0-9_]*)\s*\(", s)
+        if m:
+            out[m.group(1)] = section
+    return out
+
+
+def signature_text(fn: Any) -> str:
+    sig = inspect.signature(fn)
+    params = [p for name, p in sig.parameters.items() if name != "self"]
+    text = str(sig.replace(parameters=params))
+    text = re.sub(r"\bEnvelope\[(.+)\]", r"Envelope[\1]", text)
+    for prefix in ("rr_ra2_mgmt.models.", "rr_ra2_mgmt.condensed.", "collections.abc.", "typing."):
+        text = text.replace(prefix, "")
+    return text.replace("Envelope[NoneType]", "Envelope[None]")
+
+
+def bind_kwargs(fn: Any, params: dict[str, Any], label: str) -> tuple[list[Any], dict[str, Any]]:
+    """Map a flat params dict onto the function's signature (everything is passed by keyword)."""
+    sig = inspect.signature(fn)
+    accepted = {n for n in sig.parameters if n != "self"}
+    unknown = sorted(set(params) - accepted)
+    if unknown:
+        die(f"{label}: unknown parameter(s) {unknown}; accepted: {sorted(accepted)}")
+    missing = [
+        n for n, p in sig.parameters.items()
+        if n != "self" and p.default is inspect.Parameter.empty and n not in params
+        and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)
+    ]
+    if missing:
+        die(f"{label}: missing required parameter(s) {missing}")
+    return [], params
+
+
+# --------------------------------------------------------------------------- API docs (mkdocs index)
+
+
+def http_get(url: str, timeout: int = 20) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": "ra2-cli"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def load_index(refresh: bool = False) -> dict[str, Any]:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache = CACHE_DIR / "search_index.json"
+    fresh = cache.is_file() and (time.time() - cache.stat().st_mtime) < INDEX_TTL
+    if refresh or not fresh:
+        try:
+            data = http_get(f"{DOCS_URL}/search/search_index.json")
+            cache.write_bytes(data)
+        except Exception as exc:  # noqa: BLE001
+            if not cache.is_file():
+                die(f"cannot download API docs index from {DOCS_URL} ({exc}) and no cache exists", EXIT_COMM)
+            info(f"ra2: docs index refresh failed ({exc}); using cached copy from {time.ctime(cache.stat().st_mtime)}")
+    return json.loads(cache.read_text())
+
+
+def strip_tags(text: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&").replace("&quot;", '"')
+    return re.sub(r"\s+", " ", text).strip()
+
+
+class PageText(HTMLParser):
+    """Render the <article> of a mkdocs-material page as readable plain text with pipe tables."""
+
+    BLOCK = {"p", "div", "li", "h1", "h2", "h3", "h4", "h5", "pre", "br", "ul", "ol", "table", "blockquote"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.out: list[str] = []
+        self.skip = 0
+        self.in_pre = False
+        self.row: list[str] | None = None
+        self.cell: list[str] | None = None
+        self.href: str | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        a = dict(attrs)
+        if tag in ("script", "style", "nav", "svg") or (tag == "a" and "headerlink" in (a.get("class") or "")):
+            self.skip += 1
+            return
+        if self.skip:
+            return
+        if tag == "tr":
+            self.row = []
+        elif tag in ("td", "th"):
+            self.cell = []
+        elif self.cell is not None:
+            if tag in ("br", "p", "li", "div"):
+                self.cell.append(" ")
+        elif tag in ("h1", "h2", "h3", "h4", "h5"):
+            self.out.append("\n\n" + "#" * int(tag[1]) + " ")
+        elif tag == "pre":
+            self.in_pre = True
+            self.out.append("\n```\n")
+        elif tag == "li":
+            self.out.append("\n- ")
+        elif tag in self.BLOCK:
+            self.out.append("\n")
+        elif tag == "a":
+            href = a.get("href") or ""
+            self.href = href if href.startswith("..") or href.startswith("/") else None
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in ("script", "style", "nav", "svg") or (tag == "a" and self.skip):
+            if self.skip:
+                self.skip -= 1
+            if tag != "a":
+                return
+        if self.skip:
+            return
+        if tag == "pre" and self.cell is None:
+            self.in_pre = False
+            self.out.append("\n```\n")
+        elif tag in ("td", "th") and self.cell is not None and self.row is not None:
+            self.row.append(re.sub(r"\s+", " ", "".join(self.cell)).strip())
+            self.cell = None
+        elif tag == "tr" and self.row is not None:
+            self.out.append("\n| " + " | ".join(self.row) + " |")
+            self.row = None
+        elif tag == "a" and self.href:
+            target = re.sub(r"^(\.\./)+", "", self.href).strip("/")
+            self.write(f" [{target}]")
+            self.href = None
+        elif tag in self.BLOCK and tag != "li" and self.cell is None:
+            self.out.append("\n")
+
+    def write(self, text: str) -> None:
+        if self.cell is not None:
+            self.cell.append(text)
+        else:
+            self.out.append(text)
+
+    def handle_data(self, data: str) -> None:
+        if self.skip:
+            return
+        self.write(data if self.in_pre else re.sub(r"[ \t\r\n]+", " ", data))
+
+    def text(self) -> str:
+        txt = "".join(self.out)
+        txt = re.sub(r"[ \t]+\n", "\n", txt)
+        txt = re.sub(r"\n{3,}", "\n\n", txt)
+        return txt.strip() + "\n"
+
+
+def fetch_page_text(location: str, refresh: bool = False) -> str:
+    location = location.strip("/") + "/"
+    cache = CACHE_DIR / "pages" / (location.replace("/", "__") + "txt")
+    if cache.is_file() and not refresh and (time.time() - cache.stat().st_mtime) < INDEX_TTL:
+        return cache.read_text()
+    html = http_get(f"{DOCS_URL}/{location}").decode("utf-8", "replace")
+    m = re.search(r"<article[^>]*>(.*?)</article>", html, re.S)
+    parser = PageText()
+    parser.feed(m.group(1) if m else html)
+    text = parser.text()
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(text)
+    return text
+
+
+def index_pages(index: dict[str, Any]) -> list[str]:
+    seen: list[str] = []
+    for d in index["docs"]:
+        loc = d["location"].split("#")[0]
+        if loc and loc not in seen:
+            seen.append(loc)
+    return seen
+
+
+def resolve_location(index: dict[str, Any], term: str) -> list[str]:
+    """Match `term` to doc page locations: exact method, exact slug, then title/slug substring."""
+    pages = index_pages(index)
+    t = term.strip("/").lower()
+    if "/" in t:
+        return [p for p in pages if p.lower().rstrip("/") == t.rstrip("/")] or [p for p in pages if t in p.lower()]
+    exact = [p for p in pages if p.lower().rstrip("/").split("/")[-1] == t]
+    if exact:
+        return exact
+    slug = t.replace("_", "-")
+    exact = [p for p in pages if p.lower().rstrip("/").split("/")[-1] == slug]
+    if exact:
+        return exact
+    titles = {d["location"]: d["title"] for d in index["docs"] if "#" not in d["location"]}
+    return [p for p in pages if t in p.lower() or t in titles.get(p, "").lower()]
+
+
+def index_entries(index: dict[str, Any], location: str) -> list[dict[str, Any]]:
+    return [d for d in index["docs"] if d["location"].split("#")[0] == location]
+
+
+# --------------------------------------------------------------------------- result handling
+
+
+def emit_envelope(env: Any, args: argparse.Namespace) -> None:
+    if isinstance(env, Envelope):
+        if env.warnings:
+            info("warnings: " + json.dumps(to_jsonable(env.warnings)))
+        if env.tstamp is not None and args.envelope is False:
+            info(f"device tstamp: {env.tstamp}")
+        payload: Any = env if args.envelope else env.result
+    else:
+        payload = env
+    b64 = getattr(getattr(env, "result", env), "base64", None)
+    if args.out and isinstance(b64, str):
+        Path(args.out).write_bytes(base64.b64decode(b64))
+        info(f"wrote {args.out} ({Path(args.out).stat().st_size} bytes)")
+        rest = to_jsonable(getattr(env, "result", env))
+        rest.pop("base64", None)
+        dump(rest, args.compact)
+        return
+    dump(payload, args.compact)
+
+
+def run_guarded(fn: Any) -> Any:
+    try:
+        return fn()
+    except Ra2RpcError as exc:
+        err = {"error": exc.code, "message_id": exc.message_id, "message_params": exc.message_params, "log": exc.log,
+               "suberrors": to_jsonable(exc.suberrors), "result": to_jsonable(exc.result)}
+        info("ra2: device returned an error")
+        dump({k: v for k, v in err.items() if v is not None})
+        sys.exit(EXIT_RPC)
+    except Ra2LoginError as exc:
+        die(f"login failed: {exc}", EXIT_LOGIN)
+    except Ra2SessionExpiredError as exc:
+        die(f"session expired: {exc}", EXIT_LOGIN)
+    except Ra2CommunicationError as exc:
+        die(f"cannot reach device: {exc}", EXIT_COMM)
+    except Ra2MgmtError as exc:
+        die(f"{type(exc).__name__}: {exc}", EXIT_RPC)
+    except KeyboardInterrupt:
+        info("interrupted")
+        sys.exit(130)
+
+
+# --------------------------------------------------------------------------- commands
+
+
+def cmd_env(args: argparse.Namespace, conn: Conn) -> None:
+    dump(conn.masked(), args.compact)
+
+
+def cmd_ping(args: argparse.Namespace, conn: Conn) -> None:
+    if not conn.host:
+        die("no device host: pass --host or set RA2_HOST")
+    if conn.intermediate:
+        dev = Device(conn.host, timeout=conn.timeout, retries=conn.retries, intermediate=conn.endpoint)
+    else:
+        dev = Device(conn.endpoint, timeout=conn.timeout, retries=conn.retries)
+
+    def go() -> None:
+        t0 = time.monotonic()
+        dev.device_ping()
+        ms = round((time.monotonic() - t0) * 1000)
+        pub = dev.device_info_get_public()
+        out = {"host": conn.host, "reachable": True, "rtt_ms": ms, "public_info": to_jsonable(pub.result),
+               "device_tstamp": pub.tstamp}
+        dump(out, args.compact)
+
+    run_guarded(go)
+
+
+def cmd_methods(args: argparse.Namespace, conn: Conn) -> None:
+    pat = re.compile(args.pattern, re.I) if args.pattern else None
+    dev_sections = sections_of(Device)
+    rows: list[dict[str, Any]] = []
+    for cls, kind in ((Device, "device"), (Helper, "helper")):
+        for name, fn in public_methods(cls):
+            if pat and not (pat.search(name) or pat.search(first_line(fn.__doc__))):
+                continue
+            rows.append({
+                "kind": kind,
+                "section": dev_sections.get(name, "Helper flows") if kind == "device" else "Helper flows",
+                "name": name,
+                "signature": signature_text(fn),
+                "summary": first_line(fn.__doc__),
+                "destructive": is_destructive(name),
+                "public": kind == "device" and is_public(fn),
+            })
+    for name in DOCS_ONLY_METHODS:
+        if not pat or pat.search(name):
+            rows.append({"kind": "docs-only", "section": "Not wrapped by the library — use `ra2 rpc`",
+                         "name": name, "signature": "", "summary": "see `ra2 doc " + name + "`",
+                         "destructive": is_destructive(name), "public": False})
+    if args.json:
+        dump(rows, args.compact)
+        return
+    current = None
+    for r in rows:
+        if r["section"] != current:
+            current = r["section"]
+            sys.stdout.write(f"\n## {current}\n")
+        flags = ("  [DESTRUCTIVE]" if r["destructive"] else "") + ("  [public]" if r["public"] else "")
+        prefix = "helper." if r["kind"] == "helper" else ""
+        sys.stdout.write(f"{prefix}{r['name']}{r['signature']}{flags}\n")
+        if r["summary"]:
+            sys.stdout.write(f"    {r['summary']}\n")
+
+
+def cmd_doc(args: argparse.Namespace, conn: Conn) -> None:
+    index = load_index(refresh=args.refresh)
+    if args.list is not None:
+        prefix = args.list.strip("/")
+        for p in index_pages(index):
+            if not prefix or p.lower().startswith(prefix.lower()):
+                sys.stdout.write(p + "\n")
+        return
+    if args.search:
+        needle = args.search.lower()
+        hits = 0
+        for d in index["docs"]:
+            text = strip_tags(d["text"])
+            hay = (d["title"] + " " + text).lower()
+            if needle in hay:
+                hits += 1
+                i = text.lower().find(needle)
+                snippet = text[max(0, i - 80): i + 120] if i >= 0 else text[:200]
+                sys.stdout.write(f"{d['location']}\n    {d['title']}: …{snippet}…\n")
+        if not hits:
+            info("no matches")
+        return
+    if not args.name:
+        die("doc: give a method/model/concept name, or --search TEXT, or --list [PREFIX]")
+
+    name = args.name
+    # 1) library side: signature + docstring of the same-named Device/Helper method
+    for cls, prefix in ((Device, ""), (Helper, "helper.")):
+        fn = getattr(cls, name, None)
+        if fn and callable(fn) and not name.startswith("_"):
+            sys.stdout.write(f"### library: {prefix}{name}{signature_text(fn)}\n")
+            sys.stdout.write(inspect.cleandoc(fn.__doc__ or "") + "\n\n")
+    if name in DOCS_ONLY_METHODS:
+        sys.stdout.write("### library: not wrapped — call it with `ra2 rpc " + name + " '{...}'`\n\n")
+
+    # 2) docs side
+    locations = resolve_location(index, name)
+    if not locations:
+        info(f"no API docs page matches {name!r} (try `ra2 doc --search {name}`)")
+        return
+    if len(locations) > 1 and not args.full:
+        sys.stdout.write("### API docs: several pages match\n" + "\n".join(locations) + "\n")
+        return
+    loc = locations[0]
+    sys.stdout.write(f"### API docs: {DOCS_URL}/{loc}\n")
+    if args.full:
+        try:
+            sys.stdout.write(fetch_page_text(loc, refresh=args.refresh))
+        except (urllib.error.URLError, OSError) as exc:
+            info(f"page fetch failed ({exc}); falling back to the index summary")
+            args.full = False
+    if not args.full:
+        for d in index_entries(index, loc):
+            title = d["title"]
+            text = strip_tags(d["text"])
+            if not text:
+                continue
+            sys.stdout.write(f"\n[{title}]\n{text}\n")
+        sys.stdout.write("\n(use --full for the complete page with parameter tables)\n")
+
+
+def cmd_call(args: argparse.Namespace, conn: Conn) -> None:
+    fn = getattr(Device, args.method, None)
+    if fn is None or args.method.startswith("_") or not callable(fn):
+        hint = " (documented but not wrapped — use `ra2 rpc`)" if args.method in DOCS_ONLY_METHODS else ""
+        die(f"Device has no method {args.method!r}{hint}; see `ra2 methods`")
+    params = parse_params(args.params)
+    _, kwargs = bind_kwargs(fn, params, args.method)
+    dev = conn.device(need_auth=not is_public(fn))
+    if is_destructive(args.method):
+        info(f"ra2: {args.method} changes device state")
+    run_guarded(lambda: emit_envelope(getattr(dev, args.method)(**kwargs), args))
+
+
+def cmd_helper(args: argparse.Namespace, conn: Conn) -> None:
+    fn = getattr(Helper, args.name, None)
+    if fn is None or args.name.startswith("_") or not callable(fn):
+        die(f"Helper has no method {args.name!r}; see `ra2 methods`")
+    params = parse_params(args.params)
+    _, kwargs = bind_kwargs(fn, params, "helper." + args.name)
+    dev = conn.device()
+    if is_destructive(args.name):
+        info(f"ra2: helper.{args.name} changes device state")
+
+    def go() -> None:
+        with dev:
+            result = getattr(dev.helper, args.name)(**kwargs)
+            if isinstance(result, Iterator):
+                for item in result:
+                    if isinstance(item, str):
+                        sys.stdout.write(item + "\n")
+                    else:
+                        dump(item, compact=True)
+                    sys.stdout.flush()
+                return
+            emit_envelope(result, args)
+
+    run_guarded(go)
+
+
+def cmd_rpc(args: argparse.Namespace, conn: Conn) -> None:
+    params = parse_params(args.params)
+    if not conn.host:
+        die("no device host: pass --host or set RA2_HOST")
+    host = conn.endpoint
+    target = conn.host if conn.intermediate else None
+    if is_destructive(args.method):
+        info(f"ra2: {args.method} changes device state")
+
+    def go() -> None:
+        if args.public:
+            env = transport.rpc(host, conn.token or "", args.method, params, target=target, timeout=conn.timeout,
+                                retries=conn.retries)
+        else:
+            if conn.token:
+                token, own = conn.token, False
+            elif conn.user and conn.password:
+                token, own = transport.login(host, conn.user, conn.password, timeout=conn.timeout), True
+            else:
+                die("no credentials for a private RPC; use --public for device_ping/device_info_get_public/messages_get",
+                    EXIT_LOGIN)
+            try:
+                env = transport.rpc(host, token, args.method, params, target=target, timeout=conn.timeout,
+                                    retries=conn.retries)
+            finally:
+                if own:
+                    transport.logout(host, token, timeout=conn.timeout)
+        if env.get("error"):
+            info("ra2: device returned an error")
+            dump(env, args.compact)
+            sys.exit(EXIT_RPC)
+        dump(env, args.compact)
+
+    run_guarded(go)
+
+
+def walk(obj: Any, path: str) -> Any:
+    cur = obj
+    for seg in [s for s in path.split(".") if s]:
+        if isinstance(cur, list):
+            try:
+                cur = cur[int(seg)]
+            except (ValueError, IndexError):
+                die(f"path {path!r}: no list index {seg!r}")
+        elif isinstance(cur, dict):
+            if seg not in cur:
+                near = [k for k in cur if seg.lower() in k.lower()][:10]
+                die(f"path {path!r}: no key {seg!r}" + (f"; similar: {near}" if near else ""))
+            cur = cur[seg]
+        else:
+            die(f"path {path!r}: cannot descend into {type(cur).__name__} at {seg!r}")
+    return cur
+
+
+def set_path(obj: dict[str, Any], path: str, value: Any) -> Any:
+    segs = [s for s in path.split(".") if s]
+    if len(segs) < 2:
+        die("config set: path must be SECTION.KEY (e.g. main.RR_StationName)")
+    cur: Any = obj
+    for seg in segs[:-1]:
+        cur = walk(cur, seg) if isinstance(cur, dict) else cur[int(seg)]
+    last = segs[-1]
+    if isinstance(cur, list):
+        cur[int(last)] = value
+    else:
+        if last not in cur:
+            die(f"config set: {path!r} does not exist in config_data (new keys are not allowed)")
+        old = cur[last]
+        if old is not None and value is not None and type(old) is not type(value) and not (
+                isinstance(old, (int, float)) and isinstance(value, (int, float))):
+            die(f"config set: {path!r} is {type(old).__name__} but got {type(value).__name__} ({value!r})")
+        cur[last] = value
+        return old
+    return None
+
+
+def find_key(obj: Any, key: str, path: str = "", hits: list[tuple[str, Any]] | None = None) -> list[tuple[str, Any]]:
+    hits = [] if hits is None else hits
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            p = f"{path}.{k}" if path else k
+            if k == key:
+                hits.append((p, v))
+            find_key(v, key, p, hits)
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            find_key(v, key, f"{path}.{i}", hits)
+    return hits
+
+
+def cmd_config(args: argparse.Namespace, conn: Conn) -> None:
+    dev = conn.device()
+
+    def go() -> None:
+        with dev:
+            cfg = dev.settings_get().result
+            if args.sub == "get":
+                dump(walk(cfg.config_data, args.path or ""), args.compact)
+            elif args.sub == "keys":
+                node = walk(cfg.config_data, args.path or "")
+                if isinstance(node, dict):
+                    for k, v in node.items():
+                        kind = "table" if isinstance(v, list) else type(v).__name__
+                        preview = "" if isinstance(v, (dict, list)) else f" = {json.dumps(v, ensure_ascii=False)[:60]}"
+                        sys.stdout.write(f"{k}  ({kind}{', ' + str(len(v)) + ' rows' if isinstance(v, list) else ''}){preview}\n")
+                else:
+                    dump(node, args.compact)
+            elif args.sub == "meta":
+                key = args.path.split(".")[-1]
+                try:
+                    dump(walk(cfg.config_meta, args.path), args.compact)
+                except SystemExit:
+                    hits = find_key(cfg.config_meta, key)
+                    if not hits:
+                        die(f"config meta: nothing named {key!r} in config_meta")
+                    dump({p: v for p, v in hits}, args.compact)
+            elif args.sub == "set":
+                if not args.assignments:
+                    die("config set: give PATH=VALUE assignments")
+                changes: dict[str, Any] = {}
+                for item in args.assignments:
+                    if "=" not in item:
+                        die(f"config set: expected PATH=VALUE, got {item!r}")
+                    path, _, raw = item.partition("=")
+                    value = parse_value(raw)
+                    old = set_path(cfg.config_data, path.strip(), value)
+                    changes[path.strip()] = {"old": old, "new": value}
+                info("ra2: saving configuration (settings_save_init + settings_save_reconnect)…")
+                saved = dev.helper.settings_save(cfg.config_data)
+                for path, ch in changes.items():
+                    ch["device"] = walk(saved.result.config_data, path)
+                if saved.warnings:
+                    info("warnings: " + json.dumps(to_jsonable(saved.warnings)))
+                dump(changes, args.compact)
+
+    run_guarded(go)
+
+
+def cmd_status(args: argparse.Namespace, conn: Conn) -> None:
+    dev = conn.device()
+    run_guarded(lambda: dump(dev.helper.status_info(args.types), args.compact))
+
+
+# --------------------------------------------------------------------------- argument parsing
+
+
+GLOBAL_DEFAULTS: dict[str, Any] = {'host': None, 'port': None, 'user': None, 'password': None, 'token': None, 'intermediate': None, 'timeout': None, 'retries': None, 'compact': False, 'envelope': False, 'out': None}
+
+
+def _sub_parser_class(common: argparse.ArgumentParser) -> type[argparse.ArgumentParser]:
+    """Subparsers that also accept the global options, so `CMD --flag` works like `--flag CMD`."""
+
+    class _Sub(argparse.ArgumentParser):
+        def __init__(self, **kwargs: Any) -> None:
+            kwargs.setdefault("parents", [common])
+            super().__init__(**kwargs)
+
+    return _Sub
+
+
+def build_parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False, argument_default=argparse.SUPPRESS)
+    g = common.add_argument_group("connection (override RA2_* env / .env.ra2)")
+    g.add_argument("--host")
+    g.add_argument("--port", type=int, help=f"HTTPS port of the device API (default {DEFAULT_API_PORT}; RA2_API_PORT)")
+    g.add_argument("--user")
+    g.add_argument("--password")
+    g.add_argument("--token", help="reuse an existing session token instead of logging in")
+    g.add_argument("--intermediate", help="directly reachable device that forwards to --host (remote access)")
+    g.add_argument("--timeout", type=int, help=f"socket timeout in seconds (default {DEFAULT_TIMEOUT})")
+    g.add_argument("--retries", type=int, help=f"retries on communication error (default {DEFAULT_RETRIES})")
+    o = common.add_argument_group("output")
+    o.add_argument("--compact", "-c", action="store_true", help="single-line JSON")
+    o.add_argument("--envelope", action="store_true", help="print the whole envelope (result, warnings, tstamp)")
+    o.add_argument("--out", metavar="FILE", help="decode a base64 file result into FILE")
+
+    p = argparse.ArgumentParser(parents=[common], prog="ra2", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND", parser_class=_sub_parser_class(common))
+
+    sub.add_parser("env", help="show resolved connection settings").set_defaults(func=cmd_env)
+    sub.add_parser("ping", help="device_ping + device_info_get_public without credentials").set_defaults(func=cmd_ping)
+
+    m = sub.add_parser("methods", help="list library methods (Device + Helper) with summaries")
+    m.add_argument("pattern", nargs="?", help="regex filtered against name and summary")
+    m.add_argument("--json", action="store_true")
+    m.set_defaults(func=cmd_methods)
+
+    d = sub.add_parser("doc", help="API docs lookup for a method, model or concept")
+    d.add_argument("name", nargs="?", help="method name (events_get), model slug (event-filter) or page path")
+    d.add_argument("--full", action="store_true", help="fetch the complete page (parameter/return tables)")
+    d.add_argument("--search", metavar="TEXT", help="full-text search across the docs index")
+    d.add_argument("--list", nargs="?", const="", metavar="PREFIX", help="list doc pages (Methods/, Models/, …)")
+    d.add_argument("--refresh", action="store_true", help="ignore the local cache")
+    d.set_defaults(func=cmd_doc)
+
+    c = sub.add_parser("call", help="call a Device method: ra2 call events_get 'filter={\"tstamp_from\":0}' limit=5")
+    c.add_argument("method")
+    c.add_argument("params", nargs="*")
+    c.set_defaults(func=cmd_call)
+
+    h = sub.add_parser("helper", help="call a Helper flow: ra2 helper icmp_ping destination_ip=10.0.0.1 size=64 count=3 period=1000 timeout=2000")
+    h.add_argument("name")
+    h.add_argument("params", nargs="*")
+    h.set_defaults(func=cmd_helper)
+
+    r = sub.add_parser("rpc", help="raw Racom-RPC call, params sent verbatim, full envelope printed")
+    r.add_argument("method")
+    r.add_argument("params", nargs="*")
+    r.add_argument("--public", action="store_true", help="send without logging in")
+    r.set_defaults(func=cmd_rpc)
+
+    cfg = sub.add_parser("config", help="configuration shortcuts")
+    cs = cfg.add_subparsers(dest="sub", required=True, metavar="get|keys|meta|set")
+    a = cs.add_parser("get", help="print config_data (or the value at PATH, e.g. main.RR_StationName)")
+    a.add_argument("path", nargs="?")
+    a = cs.add_parser("keys", help="list keys under PATH (default: sections)")
+    a.add_argument("path", nargs="?")
+    a = cs.add_parser("meta", help="print config_meta for PATH or any key with that name (constraints, options)")
+    a.add_argument("path")
+    a = cs.add_parser("set", help="read config, apply PATH=VALUE assignments, save via init+reconnect")
+    a.add_argument("assignments", nargs="*")
+    cfg.set_defaults(func=cmd_config)
+
+    s = sub.add_parser("status", help="decoded status_info records: ra2 status system_basic ntp radio")
+    s.add_argument("types", nargs="+")
+    s.set_defaults(func=cmd_status)
+    return p
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    for key, value in GLOBAL_DEFAULTS.items():
+        if not hasattr(args, key):
+            setattr(args, key, value)
+    conn = resolve_conn(args)
+    args.func(args, conn)
+
+
+if __name__ == "__main__":
+    main()
