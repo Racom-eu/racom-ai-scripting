@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Wrapper: run netconf_cli.py with the interpreter that has libyang/ncclient installed.
+# Order: $NETCONF_PYTHON, <repo>/.venv/bin/python, python3 (if it can import libyang).
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/../../.." && pwd)"
+for PY in "${NETCONF_PYTHON:-}" "$REPO/.venv/bin/python" "$(command -v python3 || true)"; do
+  [ -n "$PY" ] && [ -x "$PY" ] || continue
+  if "$PY" -c "import libyang, ncclient" >/dev/null 2>&1; then
+    exec "$PY" "$HERE/netconf_cli.py" "$@"
+  fi
+done
+echo "netconf: no Python with libyang + ncclient found. Run: bash $HERE/setup.sh" >&2
+exit 1

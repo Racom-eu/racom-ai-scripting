@@ -1,3 +1,6 @@
 [submodule "skills/api/ra2_mgmt"]
 	path = skills/api/ra2_mgmt
 	url = https://github.com/Racom-eu/ra2_mgmt.git
+[submodule "skills/netconf/rac_netconf_mgmt"]
+	path = skills/netconf/rac_netconf_mgmt
+	url = https://github.com/Racom-eu/rac_netconf_mgmt.git

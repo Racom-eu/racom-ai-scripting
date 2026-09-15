@@ -39,6 +39,19 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
         zsh \
     && rm -rf /var/lib/apt/lists/*
 
+# ---- Native deps for skills/netconf (libyang C library + headers) ----------
+# The Python `libyang` binding pinned by rac_netconf_mgmt needs libyang soversion >= 4.2.2;
+# Ubuntu 24.04 ships 2.1.x, so build CESNET/libyang from source. Also provides `yanglint`.
+ARG LIBYANG_VERSION=4.2.2
+RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
+    && apt-get install -y --no-install-recommends python3-dev cmake libpcre2-dev libssh-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL "https://github.com/CESNET/libyang/archive/refs/tags/v${LIBYANG_VERSION}.tar.gz" | tar xz -C /tmp \
+    && cmake -S "/tmp/libyang-${LIBYANG_VERSION}" -B /tmp/libyang-build -DCMAKE_BUILD_TYPE=Release \
+         -DENABLE_TESTS=OFF -DENABLE_VALGRIND_TESTS=OFF -DCMAKE_INSTALL_PREFIX=/usr/local \
+    && make -C /tmp/libyang-build -j"$(nproc)" && make -C /tmp/libyang-build install && ldconfig \
+    && rm -rf /tmp/libyang-*
+
 # ---- Node.js (required by Claude Code) --------------------------------------
 RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
