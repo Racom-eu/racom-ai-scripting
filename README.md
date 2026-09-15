@@ -34,6 +34,7 @@ The RACOM standard development container with
 docker-compose.yml    # Container definition (used by BOTH compose and devcontainer)
 .env                  # Local runtime settings (git-ignored)
 .env.example          # Shared template for .env
+docs/scripting/       # Writing scripts that run in a RipEx2/RA2 device: RA2 API vs NETCONF access, runtime contract, examples
 ```
 
 ## Persistent memory
@@ -133,6 +134,29 @@ rm -f .claude-home/.credentials.json
 
 Global npm packages live in `/usr/local/npm-global`, owned by `vscode`, so
 `npm i -g` works without sudo.
+
+## Claude Code plugin & skills
+
+This repository doubles as the Claude Code plugin **`racom`** (`.claude-plugin/plugin.json`);
+every `skills/<name>/SKILL.md` becomes `/racom:<name>`. The plugin is loaded in place through a
+symlink that `post-create.sh` creates in the persistent memory, or manually:
+
+```bash
+mkdir -p ~/.claude/skills && ln -sfn /workspaces/workspace ~/.claude/skills/racom   # auto-loads as racom@skills-dir
+claude plugin details racom                                                         # verify
+claude --plugin-dir /workspaces/workspace                                           # alternative: this session only
+```
+
+Do not `claude plugin install` this repository from a marketplace — that copies the whole plugin
+root (including `.claude-home`) into the plugin cache.
+
+| skill | what it gives Claude |
+|-------|----------------------|
+| `skills/scripting/` | Scripts that run inside the device under the Scripting launcher: the `scripting` CLI (`skills/scripting/scripts/scripting` — new/check/deploy/run/logs), templates and the runtime contract. Documentation in `docs/scripting/`. |
+| `skills/netconf/` | RipEx2 / RA2 over NETCONF/YANG: the `netconf` CLI (`skills/netconf/scripts/netconf`), the `rr_netconf_mgmt` library (git submodule). Needs `bash skills/netconf/scripts/setup.sh` once (builds libyang 4.2.2, creates `.venv`). Shares `.env.ra2` with `skills/api`. |
+| `skills/api/` | RipEx2 / RA2 device HTTPS RPC API: the `ra2` CLI (`skills/api/scripts/ra2`), the `rr_ra2_mgmt` library (git submodule, `git submodule update --init`), cached API-docs lookup, and reference notes. Device address/credentials go to `.env.ra2` (copy `.env.ra2.example`). |
+
+See `CLAUDE.md` for the conventions that apply when working in this repository.
 
 ## Notes
 
