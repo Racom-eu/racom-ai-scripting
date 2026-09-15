@@ -1,0 +1,14 @@
+# =============================================================================
+#  RACOM - Claude Code Development Sandbox | build context exclusions
+#  (c) 2025 RACOM s.r.o. All rights reserved.
+# =============================================================================
+.git
+.prime
+node_modules
+.venv
+__pycache__/
+*.pyc
+.env
+.env.*
+.claude/
+.claude-home/

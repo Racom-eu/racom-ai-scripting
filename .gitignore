@@ -1,0 +1,28 @@
+# =============================================================================
+#  RACOM - Claude Code Development Sandbox | git exclusions
+#  (c) 2025 RACOM s.r.o. All rights reserved.
+# =============================================================================
+
+# Never commit credentials or local agent state.
+# .env holds LOCAL runtime settings (userns mapping etc.) - keep it local,
+# but DO track .env.example as the shared template.
+.env
+.env.*
+!.env.example
+.claude/
+.claude.json
+.credentials.json
+.prime/
+
+# Persistent Claude memory volume (bind-mounted into the container).
+# Contains session credentials + machine-local state -> keep it out of git,
+# but DO keep the directory itself: it is your persistent memory.
+.claude-home/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Node
+node_modules/

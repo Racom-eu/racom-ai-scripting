@@ -1,0 +1,56 @@
+// =============================================================================
+//  RACOM - Claude Code Development Sandbox
+// -----------------------------------------------------------------------------
+//  Component : racom-claude-sandbox (dev container definition)
+//  Owner     : RACOM - Development Tooling
+//  License   : Proprietary - (c) 2025 RACOM s.r.o. All rights reserved.
+//  Config    : This dev container is driven by ../docker-compose.yml, so all
+//              runtime-specific settings (userns mapping, image name, branding)
+//              come from the project-root .env file. See .env.example.
+//  Notes     : No login/credentials are seeded. Run `claude` inside the
+//              container and sign in interactively.
+// =============================================================================
+{
+  "name": "RACOM Claude Sandbox",
+
+  // Compose-driven: .env is loaded automatically from the project root.
+  "dockerComposeFile": ["../docker-compose.yml"],
+  "service": "sandbox",
+  "workspaceFolder": "/workspaces/workspace",
+  "overrideCommand": true,
+
+  "remoteUser": "vscode",
+
+  // Must stay false: the uid mapping is owned by RACOM_USERNS in .env.
+  // Letting the dev container rewrite the uid fights with podman keep-id.
+  "updateRemoteUserUID": false,
+
+  // Create the persistent-memory directory on the host before the container
+  // starts, so the runtime does not create it root-owned.
+  "initializeCommand": "mkdir -p \"${localWorkspaceFolder}/.claude-home\" \"${localWorkspaceFolder}/.claude-home/projects\"",
+
+  // NO dev container "features" on purpose.
+  // The features installer builds an extra stage from the unqualified image
+  // name `dev_container_feature_content_temp`. Rootless podman cannot resolve
+  // short names and stops with an interactive "Please select an image" prompt,
+  // which hangs "Reopen in Container" forever.
+  // Install tooling in the Dockerfile instead. If you need container access
+  // from inside, mount the podman socket (see docker-compose.yml).
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "anthropic.claude-code",
+        "ms-python.python",
+        "eamodio.gitlens"
+      ],
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "window.title": "RACOM | ${activeEditorShort}${separator}${rootName}"
+      }
+    }
+  },
+
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "postStartCommand": "bash .devcontainer/post-start.sh"
+}

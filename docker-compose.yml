@@ -1,0 +1,52 @@
+# =============================================================================
+#  RACOM - Claude Code Development Sandbox
+# -----------------------------------------------------------------------------
+#  Component : racom-claude-sandbox (standalone Docker sandbox)
+#  Owner     : RACOM - Development Tooling
+#  License   : Proprietary - (c) 2025 RACOM s.r.o. All rights reserved.
+#  Usage     : docker compose build && docker compose run --rm sandbox
+#  Config    : runtime-specific values live in .env (see .env.example)
+#  Notes     : Works without VS Code / the devcontainer CLI.
+#              No credentials are seeded; log in with `claude` inside.
+# =============================================================================
+name: racom-claude-sandbox
+
+services:
+  sandbox:
+    build:
+      context: ./.devcontainer
+      dockerfile: Dockerfile
+      args:
+        RACOM_ENV_NAME: "${RACOM_ENV_NAME:-RACOM Claude Sandbox}"
+    # `localhost/` prefix keeps podman from resolving this to docker.io and
+    # attempting a pull of a non-existent public image. Docker treats it as a
+    # plain local tag. Combined with pull_policy the image is only ever built.
+    image: "${RACOM_IMAGE:-localhost/racom/claude-sandbox:latest}"
+    pull_policy: never
+    container_name: "${RACOM_CONTAINER_NAME:-racom-claude-sandbox}"
+    hostname: "${RACOM_HOSTNAME:-racom-sandbox}"
+    # Sourced from .env. Empty value = runtime default (required for Docker).
+    userns_mode: "${RACOM_USERNS:-}"
+    security_opt:
+      - "${RACOM_SECURITY_OPT:-label=disable}"
+    labels:
+      com.racom.component: "claude-sandbox"
+      com.racom.tier: "development"
+    init: true
+    working_dir: /workspaces/workspace
+    volumes:
+      - .:/workspaces/workspace:cached
+      # Persistent memory bind mount (host ./.claude-home <-> container ~/.claude)
+      - ./.claude-home:/home/vscode/.claude
+      - racom-claude-history:/commandhistory
+    environment:
+      HISTFILE: /commandhistory/.bash_history
+      RACOM_ENV_NAME: "${RACOM_ENV_NAME:-RACOM Claude Sandbox}"
+      RACOM_SANDBOX: "1"
+    stdin_open: true
+    tty: true
+    command: bash
+
+volumes:
+  racom-claude-history:
+    name: racom-claude-history
