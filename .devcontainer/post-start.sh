@@ -4,7 +4,7 @@
 # -----------------------------------------------------------------------------
 #  Component : racom-claude-sandbox (postStartCommand hook)
 #  Owner     : RACOM - Development Tooling
-#  License   : Proprietary - (c) 2025 RACOM s.r.o. All rights reserved.
+#  License   : Apache-2.0 - (c) 2025 RACOM s.r.o. See the LICENSE file.
 #  Purpose   : Print the branded banner and login status on every start.
 # =============================================================================
 set -uo pipefail

@@ -5,7 +5,7 @@
 #  Component : racom/claude-sandbox (container image)
 #  Purpose   : Reproducible, non-root dev container with Claude Code preinstalled
 #  Owner     : RACOM - Development Tooling
-#  License   : Proprietary - (c) 2025 RACOM s.r.o. All rights reserved.
+#  License   : Apache-2.0 - (c) 2025 RACOM s.r.o. See the LICENSE file.
 #  Notes     : No credentials are baked into this image. Authentication is
 #              performed interactively by the developer inside the container.
 # =============================================================================
@@ -19,7 +19,7 @@ ARG RACOM_ENV_NAME="RACOM Claude Sandbox"
 LABEL org.opencontainers.image.vendor="RACOM" \
       org.opencontainers.image.title="RACOM Claude Sandbox" \
       org.opencontainers.image.description="RACOM standard development container with Claude Code preinstalled." \
-      org.opencontainers.image.licenses="Proprietary" \
+      org.opencontainers.image.licenses="Apache-2.0" \
       com.racom.component="claude-sandbox" \
       com.racom.tier="development"
 

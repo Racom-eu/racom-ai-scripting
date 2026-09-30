@@ -3,7 +3,7 @@
 # -----------------------------------------------------------------------------
 #  Component : racom-claude-sandbox (standalone Docker sandbox)
 #  Owner     : RACOM - Development Tooling
-#  License   : Proprietary - (c) 2025 RACOM s.r.o. All rights reserved.
+#  License   : Apache-2.0 - (c) 2025 RACOM s.r.o. See the LICENSE file.
 #  Usage     : docker compose build && docker compose run --rm sandbox
 #  Config    : runtime-specific values live in .env (see .env.example)
 #  Notes     : Works without VS Code / the devcontainer CLI.

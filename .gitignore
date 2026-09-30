@@ -1,6 +1,6 @@
 # =============================================================================
 #  RACOM - Claude Code Development Sandbox | git exclusions
-#  (c) 2025 RACOM s.r.o. All rights reserved.
+#  (c) 2025 RACOM s.r.o. Licensed under the Apache License, Version 2.0.
 # =============================================================================
 
 # Never commit credentials or local agent state.

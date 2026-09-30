@@ -1,6 +1,6 @@
 # =============================================================================
 #  RACOM - Claude Code Development Sandbox | build context exclusions
-#  (c) 2025 RACOM s.r.o. All rights reserved.
+#  (c) 2025 RACOM s.r.o. Licensed under the Apache License, Version 2.0.
 # =============================================================================
 .git
 .prime

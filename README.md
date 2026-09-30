@@ -2,7 +2,7 @@
 
 > **Owner:** RACOM — Development Tooling
 > **Component:** `racom-claude-sandbox`
-> **License:** Proprietary — © 2025 RACOM s.r.o. All rights reserved.
+> **License:** [Apache-2.0](LICENSE) — © 2025 RACOM s.r.o.
 
 The RACOM standard development container with
 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) pre-installed.
@@ -224,3 +224,10 @@ printf 'short-name-mode="disabled"\n' >> ~/.config/containers/registries.conf
 For container access from inside the sandbox, mount the podman socket
 (see the commented `volumes:` entries in `docker-compose.yml`) instead of using
 the `docker-outside-of-docker` feature.
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
+
+The two libraries referenced as git submodules — `skills/api/ra2_mgmt` and
+`skills/netconf/rac_netconf_mgmt` — are separate projects with their own terms.

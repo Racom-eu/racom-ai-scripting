@@ -3,7 +3,7 @@
 #  RACOM - Claude Code Development Sandbox | memory mount diagnostics
 # -----------------------------------------------------------------------------
 #  Owner   : RACOM - Development Tooling
-#  License : Proprietary - (c) 2025 RACOM s.r.o. All rights reserved.
+#  License : Apache-2.0 - (c) 2025 RACOM s.r.o. See the LICENSE file.
 #  Usage   : bash .devcontainer/doctor.sh   (run INSIDE the container)
 # =============================================================================
 set -uo pipefail

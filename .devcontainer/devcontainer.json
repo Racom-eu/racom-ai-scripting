@@ -3,7 +3,7 @@
 // -----------------------------------------------------------------------------
 //  Component : racom-claude-sandbox (dev container definition)
 //  Owner     : RACOM - Development Tooling
-//  License   : Proprietary - (c) 2025 RACOM s.r.o. All rights reserved.
+//  License   : Apache-2.0 - (c) 2025 RACOM s.r.o. See the LICENSE file.
 //  Config    : This dev container is driven by ../docker-compose.yml, so all
 //              runtime-specific settings (userns mapping, image name, branding)
 //              come from the project-root .env file. See .env.example.
