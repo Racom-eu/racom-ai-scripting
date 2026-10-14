@@ -11,6 +11,7 @@
 !.env.example
 !.env.ra2.example
 .claude/
+.codex-home/
 .claude.json
 .credentials.json
 .prime/

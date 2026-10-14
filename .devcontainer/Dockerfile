@@ -73,7 +73,7 @@ USER ${USERNAME}
 # ---- Claude Code ------------------------------------------------------------
 # Installed globally at build time. NO credentials or API keys are baked in;
 # run `claude` inside the container and log in interactively.
-RUN npm install -g @anthropic-ai/claude-code \
+RUN npm install -g @anthropic-ai/claude-code @openai/codex@latest \
     && claude --version
 
 # ---- Python tooling (uv) ----------------------------------------------------

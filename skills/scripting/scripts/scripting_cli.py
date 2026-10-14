@@ -34,6 +34,9 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
+from racom_safety import guard_cli
+
 SKILL_DIR = Path(__file__).resolve().parent.parent
 REPO_DIR = SKILL_DIR.parent.parent
 RA2_SRC = REPO_DIR / "skills" / "api" / "ra2_mgmt" / "src"
@@ -1049,6 +1052,7 @@ def main(argv: list[str] | None = None) -> None:
     for key, value in GLOBAL_DEFAULTS.items():
         if not hasattr(args, key):
             setattr(args, key, value)
+    guard_cli("scripting", args)
     conn = resolve_conn(args)
     args.func(args, conn)
 

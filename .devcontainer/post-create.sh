@@ -12,6 +12,11 @@ set -euo pipefail
 CLAUDE_HOME="/home/vscode/.claude"
 RACOM_ENV_NAME="${RACOM_ENV_NAME:-RACOM Claude Sandbox}"
 
+# Trust the bind-mounted repository without adding duplicate entries.
+if ! git config --global --get-all safe.directory '^/workspaces/workspace$' >/dev/null; then
+  git config --global --add safe.directory /workspaces/workspace
+fi
+
 # /commandhistory is a named volume and starts root-owned.
 sudo chown -R "$(id -u):$(id -g)" /commandhistory 2>/dev/null || true
 

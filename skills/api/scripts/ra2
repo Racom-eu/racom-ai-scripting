@@ -43,6 +43,9 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
+from racom_safety import WRITE_AUTH_REQUIRED, classify_method, guard_cli
+
 SKILL_DIR = Path(__file__).resolve().parent.parent
 LIB_SRC = SKILL_DIR / "ra2_mgmt" / "src"
 sys.path.insert(0, str(LIB_SRC))
@@ -77,40 +80,6 @@ ENV_FILE = ".env.ra2"
 
 # RPCs documented on the API site but not (yet) wrapped by the library — use `ra2 rpc`.
 DOCS_ONLY_METHODS = ("radio_freq_tuning_get", "radio_freq_tuning_set", "keyring_secret_update_init")
-
-# Operations that change device state, reboot it, or destroy data. `ra2 methods` flags them and
-# SKILL.md requires explicit user confirmation before running any of them.
-DESTRUCTIVE_PREFIXES = (
-    "settings_save",
-    "settings_package_save",
-    "monitoring_config_save",
-    "monitoring_log_",
-    "firmware_upload",
-    "firmware_activate",
-    "firmware_module_activate",
-    "file_distribution_",
-    "reboot",
-    "reset_factory",
-    "reset_total_purge",
-    "tamper_reset",
-    "keyring_",
-    "user_",
-    "users_backup_restore",
-    "change_password",
-    "script_start",
-    "script_stop",
-    "keying_",
-    "sw_key_upload",
-    "antenna_detector_",
-    "hstdby_toggle",
-    "time_set",
-    "statistics_differential_reset",
-    "event_test_trigger",
-    "radio_freq_tuning_set",
-)
-DESTRUCTIVE_SAFE = ("keyring_status_get", "keyring_secret_status_get", "user_attributes_get", "monitoring_log_status_get",
-                    "monitoring_log_data_get", "file_distribution_status_send_get", "file_distribution_status_receive_get",
-                    "keyring_backup_get", "keyring_secret_download", "keyring_key_csr_download")
 
 EXIT_USAGE, EXIT_RPC, EXIT_COMM, EXIT_LOGIN = 1, 2, 3, 4
 
@@ -189,10 +158,6 @@ def first_line(doc: str | None) -> str:
         if line.strip():
             return line.strip()
     return ""
-
-
-def is_destructive(name: str) -> bool:
-    return name not in DESTRUCTIVE_SAFE and name.startswith(DESTRUCTIVE_PREFIXES)
 
 
 def is_public(fn: Any) -> bool:
@@ -622,14 +587,15 @@ def cmd_methods(args: argparse.Namespace, conn: Conn) -> None:
                 "name": name,
                 "signature": signature_text(fn),
                 "summary": first_line(fn.__doc__),
-                "destructive": is_destructive(name),
+                "classification": classify_method(
+                    "ra2", "call" if kind == "device" else "helper", name),
                 "public": kind == "device" and is_public(fn),
             })
     for name in DOCS_ONLY_METHODS:
         if not pat or pat.search(name):
             rows.append({"kind": "docs-only", "section": "Not wrapped by the library — use `ra2 rpc`",
                          "name": name, "signature": "", "summary": "see `ra2 doc " + name + "`",
-                         "destructive": is_destructive(name), "public": False})
+                         "classification": classify_method("ra2", "rpc", name), "public": False})
     if args.json:
         dump(rows, args.compact)
         return
@@ -638,7 +604,7 @@ def cmd_methods(args: argparse.Namespace, conn: Conn) -> None:
         if r["section"] != current:
             current = r["section"]
             sys.stdout.write(f"\n## {current}\n")
-        flags = ("  [DESTRUCTIVE]" if r["destructive"] else "") + ("  [public]" if r["public"] else "")
+        flags = f"  [{r['classification']}]" + ("  [public]" if r["public"] else "")
         prefix = "helper." if r["kind"] == "helper" else ""
         sys.stdout.write(f"{prefix}{r['name']}{r['signature']}{flags}\n")
         if r["summary"]:
@@ -714,8 +680,8 @@ def cmd_call(args: argparse.Namespace, conn: Conn) -> None:
     params = parse_params(args.params)
     _, kwargs = bind_kwargs(fn, params, args.method)
     dev = conn.device(need_auth=not is_public(fn))
-    if is_destructive(args.method):
-        info(f"ra2: {args.method} changes device state")
+    if classify_method("ra2", "call", args.method) == WRITE_AUTH_REQUIRED:
+        info(f"ra2: {args.method}: {WRITE_AUTH_REQUIRED}")
     run_guarded(lambda: emit_envelope(getattr(dev, args.method)(**kwargs), args))
 
 
@@ -726,8 +692,8 @@ def cmd_helper(args: argparse.Namespace, conn: Conn) -> None:
     params = parse_params(args.params)
     _, kwargs = bind_kwargs(fn, params, "helper." + args.name)
     dev = conn.device()
-    if is_destructive(args.name):
-        info(f"ra2: helper.{args.name} changes device state")
+    if classify_method("ra2", "helper", args.name) == WRITE_AUTH_REQUIRED:
+        info(f"ra2: helper.{args.name}: {WRITE_AUTH_REQUIRED}")
 
     def go() -> None:
         with dev:
@@ -751,8 +717,8 @@ def cmd_rpc(args: argparse.Namespace, conn: Conn) -> None:
         die("no device host: pass --host or set RA2_HOST")
     host = conn.endpoint
     target = conn.host if conn.intermediate else None
-    if is_destructive(args.method):
-        info(f"ra2: {args.method} changes device state")
+    if classify_method("ra2", "rpc", args.method) == WRITE_AUTH_REQUIRED:
+        info(f"ra2: {args.method}: {WRITE_AUTH_REQUIRED}")
 
     def go() -> None:
         if args.public:
@@ -980,6 +946,7 @@ def main(argv: list[str] | None = None) -> None:
     for key, value in GLOBAL_DEFAULTS.items():
         if not hasattr(args, key):
             setattr(args, key, value)
+    guard_cli("ra2", args)
     conn = resolve_conn(args)
     args.func(args, conn)
 

@@ -43,6 +43,7 @@ services:
       HISTFILE: /commandhistory/.bash_history
       RACOM_ENV_NAME: "${RACOM_ENV_NAME:-RACOM Claude Sandbox}"
       RACOM_SANDBOX: "1"
+      CODEX_HOME: "/workspaces/workspace/.codex-home"
     stdin_open: true
     tty: true
     command: bash

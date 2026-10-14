@@ -43,6 +43,9 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
+from racom_safety import classify_method, guard_cli
+
 SKILL_DIR = Path(__file__).resolve().parent.parent
 LIB_SRC = SKILL_DIR / "rac_netconf_mgmt" / "src"
 EXAMPLE_YANG = SKILL_DIR / "rac_netconf_mgmt" / "examples" / "mbm-root@2023-04-29.yang"
@@ -75,10 +78,6 @@ DEFAULT_MODULE = "mbm-root"
 DEFAULT_MODULES = ("mbm-root", "rr-sdk-launcher")  # searched by `find` when no --module is given
 NC_BASE_NS = "urn:ietf:params:xml:ns:netconf:base:1.0"
 EXIT_USAGE, EXIT_OP, EXIT_CONN = 1, 2, 3
-
-# Commands that change device state — SKILL.md requires explicit user confirmation first.
-DESTRUCTIVE_COMMANDS = ("set", "edit", "rpc")
-
 
 # --------------------------------------------------------------------------- utilities
 
@@ -647,12 +646,22 @@ def cmd_state(args: argparse.Namespace, conn: Conn) -> None:
     run_guarded(go)
 
 
-def cmd_rpc(args: argparse.Namespace, conn: Conn) -> None:
+def prepare_rpc(args: argparse.Namespace) -> Any:
     xml = parse_value(args.xml)
     try:
-        element = etree.fromstring(xml.encode())
+        parser = etree.XMLParser(
+            resolve_entities=False, load_dtd=False, no_network=True
+        )
+        element = etree.fromstring(xml.encode(), parser=parser)
     except etree.XMLSyntaxError as exc:
         die(f"rpc: invalid XML: {exc}")
+    if element.getroottree().docinfo.doctype:
+        die("rpc: DTD declarations are not supported")
+    return element
+
+
+def cmd_rpc(args: argparse.Namespace, conn: Conn) -> None:
+    element = args.rpc_element
     dev = conn.device()
     info(f"netconf: dispatching <{etree.QName(element).localname}>")
 
@@ -698,7 +707,7 @@ def cmd_methods(args: argparse.Namespace, conn: Conn) -> None:
         if cls != current:
             current = cls
             sys.stdout.write(f"\n## {cls}\n")
-        flag = "  [DESTRUCTIVE]" if name in ("set_config",) else ""
+        flag = f"  [{classify_method('netconf', cls, name)}]"
         sys.stdout.write(f"{name}{signature_text(fn)}{flag}\n")
         if first_line(doc):
             sys.stdout.write(f"    {first_line(doc)}\n")
@@ -821,6 +830,11 @@ def main(argv: list[str] | None = None) -> None:
     for key, value in GLOBAL_DEFAULTS.items():
         if not hasattr(args, key):
             setattr(args, key, value)
+    rpc_tag = None
+    if args.cmd == "rpc":
+        args.rpc_element = prepare_rpc(args)
+        rpc_tag = args.rpc_element.tag
+    guard_cli("netconf", args, netconf_rpc_tag=rpc_tag)
     conn = resolve_conn(args)
     args.func(args, conn)
 

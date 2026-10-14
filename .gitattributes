@@ -1,0 +1,11 @@
+* text=auto
+
+*.sh text eol=lf
+*.py text eol=lf
+Dockerfile text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+skills/api/scripts/ra2 text eol=lf
+skills/netconf/scripts/netconf text eol=lf
+skills/scripting/scripts/scripting text eol=lf

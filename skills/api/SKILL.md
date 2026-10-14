@@ -62,10 +62,13 @@ If `host` is `null`, ask for the device address and credentials, or point the us
 
 ## Rules
 
-- **Confirm before any state change.** Methods flagged `[DESTRUCTIVE]` in `ra2 methods` /
-  `methods.md` (settings_save*, firmware_*, reboot, reset_*, user_*, keyring_*, file_distribution_*,
-  script_start/stop, time_set, …) may restart services, reboot or wipe the device. State exactly
-  what will change and wait for an explicit yes. `ra2 config set` is a state change.
+- **Use the shared safety classifications** from `scripts/racom_safety.py`.
+  `[LOCAL ONLY]` does not contact the device and may mutate local objects or files.
+  `[DEVICE READ]` may contact/read the device without device-side writes or state-changing actions.
+  `[WRITE AUTH REQUIRED]` requires explicit approval and `RACOM_ALLOW_WRITE=1`, including active
+  ICMP/RSS ping, log streaming and diagnostic collection without persistent changes.
+  Describe the target, exact action and expected effects, then wait for explicit approval.
+  Unknown or ambiguous methods require write authorization.
 - **Configuration is edited, never composed.** `settings_get` → change fields in place → write the
   whole `config_data` back (`ra2 config set` / `helper.settings_save`). Check `ra2 config meta <key>`
   for allowed values. A validation error means nothing was saved — show the `suberrors`.

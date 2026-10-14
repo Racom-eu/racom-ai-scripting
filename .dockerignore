@@ -11,4 +11,5 @@ __pycache__/
 .env
 .env.*
 .claude/
+.codex-home/
 .claude-home/
